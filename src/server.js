@@ -20,6 +20,7 @@ const allowedOrigins = [
 // In development, allow all localhost origins
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
+//use cors
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
