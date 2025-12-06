@@ -1,20 +1,24 @@
 const jwt = require('jsonwebtoken');
 const { prisma } = require('../config/prisma');
 
-// Verify JWT token
+// ---------------------------------------------------------
+// Authentication Middleware
+// ---------------------------------------------------------
 const authenticate = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+
+    // Validate header
+    if (!authHeader?.startsWith('Bearer ')) {
       return res.status(401).json({ error: 'No token provided' });
     }
 
-    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    const token = authHeader.slice(7); // Remove "Bearer "
 
+    // Verify JWT
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Get user from database
+
+    // Fetch user from DB
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
       select: {
@@ -26,33 +30,37 @@ const authenticate = async (req, res, next) => {
       }
     });
 
+    // Check user validity
     if (!user || user.status !== 'ACTIVE') {
       return res.status(401).json({ error: 'Invalid or inactive user' });
     }
 
     req.user = user;
     next();
+
   } catch (error) {
-    if (error.name === 'JsonWebTokenError') {
-      return res.status(401).json({ error: 'Invalid token' });
+    switch (error.name) {
+      case 'JsonWebTokenError':
+        return res.status(401).json({ error: 'Invalid token' });
+      case 'TokenExpiredError':
+        return res.status(401).json({ error: 'Token expired' });
+      default:
+        return res.status(500).json({ error: 'Authentication error' });
     }
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expired' });
-    }
-    return res.status(500).json({ error: 'Authentication error' });
   }
 };
 
-// Role-based authorization
+// ---------------------------------------------------------
+// Authorization Middleware (Role-based)
+// ---------------------------------------------------------
 const authorize = (...roles) => {
+  const allowedRoles = roles.flat();
+
   return (req, res, next) => {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    // Flatten roles array if nested
-    const allowedRoles = roles.flat();
-    
     if (!allowedRoles.includes(req.user.role)) {
       return res.status(403).json({ error: 'Insufficient permissions' });
     }
@@ -62,4 +70,3 @@ const authorize = (...roles) => {
 };
 
 module.exports = { authenticate, authorize };
-
