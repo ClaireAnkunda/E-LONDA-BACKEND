@@ -1,13 +1,36 @@
+// db-service.js
+
 require('dotenv').config();
 const { PrismaClient } = require('@prisma/client');
 const mysql = require('mysql2/promise');
+const { URL } = require('url'); // Import URL for cleaner parsing
 
-// Parse DATABASE_URL to create MySQL connection pool (for connection testing only)
-function parseDatabaseUrl(url) {
-  if (!url) return {};
-  
-  try {
-    const dbUrl = new URL(url);
+/**
+ * 🛠️ MySQL Connection Manager Class (for testing and direct connection)
+ */
+class MySQLManager {
+  /**
+   * Parses the DATABASE_URL environment variable into a mysql2 pool config object.
+   * @param {string} url - The MySQL connection URL.
+   * @returns {mysql.PoolOptions} The configuration for the mysql2 pool.
+   * @throws {Error} If the URL is missing or invalid.
+   */
+  static parseConfig(url) {
+    if (!url) {
+      throw new Error('DATABASE_URL is not set.');
+    }
+    
+    let dbUrl;
+    try {
+      dbUrl = new URL(url);
+    } catch (e) {
+      throw new Error(`Invalid DATABASE_URL format: ${e.message}`);
+    }
+
+    if (dbUrl.protocol !== 'mysql:') {
+      throw new Error('Unsupported protocol. Expected "mysql:".');
+    }
+
     return {
       host: dbUrl.hostname,
       port: parseInt(dbUrl.port) || 3306,
@@ -16,121 +39,167 @@ function parseDatabaseUrl(url) {
       database: dbUrl.pathname.slice(1), // Remove leading '/'
       waitForConnections: true,
       connectionLimit: 10,
-      queueLimit: 0
+      queueLimit: 0,
     };
-  } catch (error) {
-    return {};
+  }
+
+  constructor(databaseUrl) {
+    this.databaseUrl = databaseUrl;
+    this.poolConfig = MySQLManager.parseConfig(databaseUrl);
+    this.pool = mysql.createPool(this.poolConfig);
+  }
+
+  /**
+   * Tests the database connection by pinging the server.
+   * @returns {Promise<void>}
+   */
+  async ping() {
+    let connection;
+    try {
+      connection = await this.pool.getConnection();
+      await connection.ping();
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  }
+
+  /**
+   * Ends the mysql2 connection pool.
+   * @returns {Promise<void>}
+   */
+  async end() {
+    return this.pool.end();
   }
 }
 
-// Create MySQL connection pool (only for connection testing)
-const poolConfig = parseDatabaseUrl(process.env.DATABASE_URL);
-const pool = mysql.createPool(poolConfig);
-
-// Create Prisma Client instance with connection pooling optimizations
-// Prisma 6 doesn't require adapters - it uses DATABASE_URL directly from schema.prisma
-const prisma = new PrismaClient({
-  log: ['error'], // Production: only log errors
-  datasources: {
-    db: {
-      url: process.env.DATABASE_URL,
-    },
-  },
-});
-
-// Test database connection
-async function testConnection() {
-  try {
-    if (!process.env.DATABASE_URL) {
-      throw new Error('DATABASE_URL is not set in .env file');
+/**
+ * ⚙️ Centralized Connection Service
+ */
+class DBService {
+  constructor() {
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) {
+      throw new Error('DATABASE_URL is not defined in environment variables.');
     }
 
-    // Test connection using the pool directly (faster than Prisma $connect)
-    const connection = await pool.getConnection();
-    await connection.ping();
-    connection.release();
+    // 1. mysql2 pool for fast connection testing and raw queries (if needed)
+    this.mysqlManager = new MySQLManager(databaseUrl);
     
-    // Parse DATABASE_URL to show connection info (without password)
-    const dbUrl = process.env.DATABASE_URL;
-    const urlObj = new URL(dbUrl);
-    
-    console.log('✅ Database connected successfully!');
-    console.log(`📍 Connected to: ${urlObj.hostname}:${urlObj.port || 3306}/${urlObj.pathname.slice(1)}`);
-    
-    return true;
-  } catch (error) {
+    // 2. Prisma Client for ORM operations
+    this.prisma = new PrismaClient({
+      log: ['error'], 
+      datasources: {
+        db: {
+          url: databaseUrl,
+        },
+      },
+    });
+  }
+
+  /**
+   * Centralized logic to display connection failure details and troubleshooting.
+   * @param {Error} error - The connection error object.
+   * @param {string} dbUrl - The full database URL for parsing (to detect config errors).
+   */
+  _logConnectionError(error, dbUrl) {
     console.error('\n❌ Database connection failed!');
     
-    // Handle AggregateError (multiple errors)
+    // Handle AggregateError (from some internal node/promise rejections)
     let actualError = error;
-    if (error.name === 'AggregateError' && error.errors && error.errors.length > 0) {
+    if (error.name === 'AggregateError' && Array.isArray(error.errors) && error.errors.length > 0) {
       actualError = error.errors[0];
       if (error.errors.length > 1) {
-        console.error(`⚠️  Multiple connection errors (${error.errors.length}):`);
+        console.error(`⚠️  Multiple connection errors (${error.errors.length}) detected.`);
       }
     }
     
-    // Show detailed error information
     const errorMessage = actualError.message || error.message || error.toString() || 'Unknown error';
-    const errorCode = actualError.code || error.code || actualError.errno || error.errno || 'N/A';
+    const errorCode = actualError.code || actualError.errno || 'N/A';
     
     console.error('🔴 Error Message:', errorMessage);
     console.error('🔴 Error Code:', errorCode);
-    
-    if (error.code === 'ECONNREFUSED' || error.code === 'P1001') {
-      console.error('⚠️  Connection refused - Database server is not running or not accessible');
-      console.error('   → Make sure MySQL/MariaDB server is running on your PC');
-      console.error('   → For localhost, check if MySQL service is started');
-      console.error('   → Windows: Check Services (services.msc) for MySQL');
-      console.error('   → Check if the port is correct (default: 3306)');
-      console.error('   → Verify DATABASE_URL uses: mysql://user:password@localhost:3306/database');
-    } else if (error.code === 'ER_ACCESS_DENIED_ERROR' || error.code === 'P1000') {
-      console.error('⚠️  Access denied - Invalid database credentials');
-      console.error('   → Check your username and password in DATABASE_URL');
-      console.error('   → Verify the user has proper permissions');
-    } else if (error.code === 'ENOTFOUND' || error.code === 'P1003') {
-      console.error('⚠️  Host not found - Cannot resolve database hostname');
-      console.error('   → Check your DATABASE_URL host in .env file');
-      console.error('   → Verify DNS/hostname is correct');
-    } else if (error.code === 'ETIMEDOUT' || error.code === 'P1002') {
-      console.error('⚠️  Connection timeout - Database server is not responding');
-      console.error('   → Check if database server is running');
-      console.error('   → Verify network connectivity');
-    } else if (error.message && error.message.includes('DATABASE_URL')) {
-      console.error('⚠️  DATABASE_URL configuration error');
-      console.error('   → Check your .env file has DATABASE_URL set');
-      console.error('   → Format: mysql://user:password@host:port/database');
+
+    // --- Suggestive Troubleshooting ---
+    if (['ECONNREFUSED', 'P1001', 'ER_CONN_REFUSED'].includes(errorCode)) {
+      console.error('⚠️  Connection refused: The database server is likely **not running** or is **inaccessible** on the specified host/port.');
+      console.error('   → Check if MySQL/MariaDB server process is running (e.g., via Task Manager, Services, or Docker status).');
+    } else if (['ER_ACCESS_DENIED_ERROR', 'P1000'].includes(errorCode)) {
+      console.error('⚠️  Access denied: Invalid database **username** or **password**.');
+      console.error('   → Verify credentials in your `.env` file match a valid MySQL user.');
+    } else if (['ENOTFOUND', 'EAI_AGAIN', 'P1003'].includes(errorCode)) {
+      console.error('⚠️  Host resolution error: Cannot resolve the database **hostname**.');
+      console.error('   → Check the host in `DATABASE_URL` (e.g., `localhost` or an IP address).');
+    } else if (['ETIMEDOUT', 'P1002'].includes(errorCode)) {
+      console.error('⚠️  Connection timeout: The database server did not respond within the time limit.');
+      console.error('   → Could be firewall/network issue or an overloaded server.');
+    } else if (errorMessage.includes('DATABASE_URL')) {
+      console.error('⚠️  DATABASE_URL configuration error. Check the format.');
     } else {
-      console.error('⚠️  Unexpected error occurred');
-      if (error.stack) {
-        console.error('📋 Stack trace:', error.stack.split('\n').slice(0, 3).join('\n'));
-      }
+      console.error('⚠️  An unexpected error occurred. Review the stack trace for details.');
     }
     
-    console.error('\n💡 Troubleshooting steps for LOCALHOST MySQL:');
-    console.error('   1. Start MySQL service on your PC:');
-    console.error('      - Windows: Open Services (Win+R → services.msc) → Find MySQL → Start');
-    console.error('      - Or use: net start MySQL (in Command Prompt as Admin)');
-    console.error('   2. Check DATABASE_URL in .env file:');
-    console.error('      Format: mysql://username:password@localhost:3306/database_name');
-    console.error('      Example: mysql://root:mypassword@localhost:3306/evoting_db');
-    console.error('      If no password: mysql://root@localhost:3306/evoting_db');
-    console.error('   3. Create the database if it doesn\'t exist:');
-    console.error('      - Open MySQL Command Line or MySQL Workbench');
-    console.error('      - Run: CREATE DATABASE evoting_db;');
-    console.error('   4. Verify MySQL is listening on port 3306:');
-    console.error('      - Check: netstat -an | findstr 3306');
-    console.error('   5. Test connection manually:');
-    console.error('      - Try: mysql -u root -p -h localhost\n');
-    
-    throw error;
+    console.error('\n📋 Recommended Steps:');
+    console.error('   1. **Start MySQL Server:** Ensure the service is active.');
+    console.error('   2. **Check .env:** Verify `DATABASE_URL` format: `mysql://user:pass@host:port/dbname`');
+    console.error('   3. **Check Credentials/Host/Port:** Double-check all parts of the URL are correct.');
+    console.error('   4. **Create Database:** Ensure the database name exists on the server.');
+  }
+
+
+  /**
+   * Tests the database connection using the faster mysql2 pool.
+   * @returns {Promise<boolean>} True if connection is successful, false otherwise.
+   */
+  async testConnection() {
+    const dbUrl = this.mysqlManager.databaseUrl;
+    try {
+      await this.mysqlManager.ping();
+      
+      const urlObj = new URL(dbUrl);
+      
+      console.log('✅ Database connected successfully!');
+      console.log(`📍 Connected to: ${urlObj.hostname}:${urlObj.port || 3306}/${urlObj.pathname.slice(1)}`);
+      
+      return true;
+    } catch (error) {
+      this._logConnectionError(error, dbUrl);
+      
+      // Re-throw the error after logging for external handling
+      throw error; 
+    }
+  }
+
+  /**
+   * Gracefully shuts down both Prisma and mysql2 connections.
+   * @returns {Promise<void>}
+   */
+  async disconnect() {
+    await Promise.allSettled([
+        this.prisma.$disconnect(),
+        this.mysqlManager.end()
+    ]);
+    console.log('🔌 Database connections gracefully closed.');
   }
 }
 
-// Handle graceful shutdown
-process.on('beforeExit', async () => {
-  await prisma.$disconnect();
-  await pool.end();
-});
+// ----------------------------------------------------
+// 🚀 Initialization and Export
+// ----------------------------------------------------
 
-module.exports = { prisma, testConnection };
+// Create a single instance of the service
+const dbService = new DBService();
+const { prisma } = dbService;
+const { testConnection, disconnect } = dbService;
+
+// Attach graceful shutdown handler
+process.on('beforeExit', disconnect);
+process.on('SIGINT', async () => { await disconnect(); process.exit(0); });
+process.on('SIGTERM', async () => { await disconnect(); process.exit(0); });
+
+// Export the Prisma client and the connection test function
+export { prisma, testConnection }; 
+// Note: Changed to ES module export style for a more modern Node.js context.
+// If your project strictly uses require/module.exports, use:
+// module.exports = { prisma, testConnection };
