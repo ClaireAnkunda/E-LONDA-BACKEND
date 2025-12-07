@@ -1,163 +1,204 @@
-// Prisma Schema for E-Voting System
+// 🗳️ E-Voting System Database Blueprint (Prisma Schema)
+
+// ----------------------------------------------------
+// ⚙️ Configuration
+// ----------------------------------------------------
+
+// Generator: Tells Prisma to produce the client library (the tool we use in Node.js/TypeScript to talk to the DB)
 generator client {
   provider = "prisma-client-js"
 }
 
+// Datasource: Defines the connection details for our database
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider = "mysql" // We're using MySQL (or a compatible database like MariaDB)
+  url      = env("DATABASE_URL") // The connection string is read securely from the .env file
 }
 
-// User accounts (Admin, Officer, Candidate)
+// ----------------------------------------------------
+// 👤 User Management & Access Control
+// ----------------------------------------------------
+
+// Model: User (The login accounts for staff and candidates)
 model User {
-  id            String    @id @default(uuid())
-  email         String    @unique
-  password      String
+  id            String    @id @default(uuid()) // Unique ID for the user
+  email         String    @unique // MUST be unique, used for login
+  password      String // Hashed password (e.g., using bcrypt)
   name          String
-  role          UserRole  @default(CANDIDATE)
-  regNo         String?   @map("reg_no")
-  program       String?
-  staffId       String?   @map("staff_id")
-  status        String    @default("ACTIVE")
-  emailVerified Boolean   @default(false) @map("email_verified")
-  createdBy     String?   @map("created_by")
+  role          UserRole  @default(CANDIDATE) // Defines permissions (Admin, Officer, or Candidate)
+  
+  // Optional identity fields, depending on the user's role:
+  regNo         String?   @map("reg_no") // Student Registration Number (for candidate verification)
+  program       String? // Program of study
+  staffId       String?   @map("staff_id") // Staff ID (for Officers/Admins)
+  
+  status        String    @default("ACTIVE") // Account status (e.g., ACTIVE, INACTIVE, SUSPENDED)
+  emailVerified Boolean   @default(false) @map("email_verified") // Tracks email confirmation
+  
+  // Audit Trail fields (who created this user):
+  createdBy     String?   @map("created_by") // The ID of the user who created this account
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 
-  // Relations
-  createdCandidates Candidate[]
+  // Relations: Linking this user to other data
+  createdCandidates Candidate[] // Candidates created by this user (if this user is an Officer/Admin)
+  
+  // Self-Relation: Tracks which users (e.g., Admins) created other users (e.g., Officers)
   createdOfficers  User[]         @relation("CreatedOfficers")
   createdByUser    User?          @relation("CreatedOfficers", fields: [createdBy], references: [id])
-  passwordResets    PasswordReset[]
+  
+  passwordResets    PasswordReset[] // Tracks password reset attempts
 
-  @@map("users")
+  @@map("users") // Maps this model to the 'users' table in the database
 }
 
+// Enum: UserRole (Fixed set of possible permissions)
 enum UserRole {
-  ADMIN
-  OFFICER
-  CANDIDATE
+  ADMIN // Full System Access (The Superuser)
+  OFFICER // Manages Elections, Candidates, and Voters
+  CANDIDATE // A user seeking nomination for a position
 }
 
-// Election Positions
+// ----------------------------------------------------
+// 🏆 Election Setup (Positions and Candidates)
+// ----------------------------------------------------
+
+// Model: Position (The offices or seats being contested)
 model Position {
   id              String    @id @default(uuid())
-  name            String
-  seats           Int       @default(1)
+  name            String // Title of the office (e.g., 'President', 'Secretary')
+  seats           Int       @default(1) // Number of available seats for this position
+
+  // 🕒 Critical Election Timeline Fields:
   nominationOpens DateTime  @map("nomination_opens_at")
   nominationCloses DateTime @map("nomination_closes_at")
   votingOpens     DateTime  @map("voting_opens_at")
   votingCloses    DateTime  @map("voting_closes_at")
+  
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  // Relations
-  candidates Candidate[]
-  votes      Vote[]
+  // Relations:
+  candidates Candidate[] // All users who have nominated for this position
+  votes      Vote[] // All votes cast for candidates in this position
 
   @@map("positions")
 }
 
-// Candidates (Nominations)
+// Model: Candidate (A user who has successfully nominated for a position)
 model Candidate {
   id          String           @id @default(uuid())
-  positionId  String           @map("position_id")
-  userId      String           @map("user_id")
+  positionId  String           @map("position_id") // The office they are running for
+  userId      String           @map("user_id") // The user account linked to this candidate
   name        String
   program     String
-  manifestoUrl String?        @map("manifesto_url")
+  manifestoUrl String?        @map("manifesto_url") // Link to their campaign statement
   photoUrl    String?          @map("photo_url")
-  status      CandidateStatus  @default(SUBMITTED)
-  reason      String?
+  status      CandidateStatus  @default(SUBMITTED) // Nomination status (Submitted, Approved, Rejected)
+  reason      String? // Reason for rejection (if applicable)
+  
   createdAt   DateTime         @default(now()) @map("created_at")
   updatedAt   DateTime         @updatedAt @map("updated_at")
 
-  // Relations
+  // Relations:
   position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
   user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  votes    Vote[]
+  votes    Vote[] // The actual votes received by this candidate
 
+  // Constraint: A user can only run once for a given position
   @@unique([positionId, userId])
   @@map("candidates")
 }
 
+// Enum: CandidateStatus (Fixed set of possible nomination states)
 enum CandidateStatus {
-  SUBMITTED
-  APPROVED
-  REJECTED
+  SUBMITTED // Waiting for approval
+  APPROVED // Eligible to receive votes
+  REJECTED // Denied nomination
 }
 
-// Eligible Voters (from CSV import)
+// ----------------------------------------------------
+// 🔒 Voting Integrity & Anonymity
+// ----------------------------------------------------
+
+// Model: EligibleVoter (The official list of people allowed to vote)
 model EligibleVoter {
   id       String   @id @default(uuid())
-  regNo    String   @unique @map("reg_no")
+  regNo    String   @unique @map("reg_no") // Unique identifier (e.g., student ID)
   name     String
-  email    String?
+  email    String? // Optional contact info
   phone    String?
   program  String?
-  status   String   @default("ELIGIBLE")
+  status   String   @default("ELIGIBLE") // Current voter status
+  
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  // Relations
-  verifications Verification[]
-  ballots       Ballot[]
+  // Relations:
+  verifications Verification[] // Tracks all OTP verification attempts by this voter
+  ballots       Ballot[] // All ballots issued to this voter
 
   @@map("eligible_voters")
 }
 
-// OTP Verifications
+// Model: Verification (OTP process to authenticate the voter before issuing a ballot)
 model Verification {
   id          String    @id @default(uuid())
-  voterId     String    @map("voter_id")
-  method      String    // "email" or "sms"
-  otpHash     String    @map("otp_hash")
+  voterId     String    @map("voter_id") // Link to the eligible voter's record
+  method      String    // The channel used: "email" or "sms"
+  otpHash     String    @map("otp_hash") // Hashed version of the OTP (security!)
+  
   issuedAt    DateTime  @default(now()) @map("issued_at")
-  expiresAt   DateTime  @map("expires_at")
-  verifiedAt  DateTime? @map("verified_at")
-  ballotToken String?   @map("ballot_token")
+  expiresAt   DateTime  @map("expires_at") // The OTP validity window
+  verifiedAt  DateTime? @map("verified_at") // Timestamp when OTP was successfully verified
+  ballotToken String?   @map("ballot_token") // The token generated upon successful verification
   consumedAt  DateTime? @map("consumed_at")
 
-  // Relations
+  // Relation: Links back to the PII record of the eligible voter
   voter EligibleVoter @relation(fields: [voterId], references: [id], onDelete: Cascade)
 
   @@map("verifications")
 }
 
-// Ballots (issued to voters)
+// Model: Ballot (The "Voter's Ticket" - issued *after* successful verification)
 model Ballot {
   id         String    @id @default(uuid())
-  voterId    String    @map("voter_id")
-  token      String    @unique
-  status     String    @default("ACTIVE") // ACTIVE, CONSUMED
+  voterId    String    @map("voter_id") // Links to the voter's PII (used only for issuing/revoking)
+  token      String    @unique // The unique token used to cast votes (the key to anonymity)
+  status     String    @default("ACTIVE") // ACTIVE or CONSUMED
   issuedAt   DateTime  @default(now()) @map("issued_at")
-  consumedAt DateTime? @map("consumed_at")
+  consumedAt DateTime? @map("consumed_at") // Timestamp when voting was completed
 
-  // Relations
+  // Relations:
   voter EligibleVoter @relation(fields: [voterId], references: [id], onDelete: Cascade)
-  votes Vote[]
+  votes Vote[] // The votes cast using this specific ballot
 
   @@map("ballots")
 }
 
-// Votes (secret ballot - no voter PII)
+// Model: Vote (The Secret Ballot - the core record of the election result)
 model Vote {
   id         String   @id @default(uuid())
-  ballotId   String   @map("ballot_id")
+  ballotId   String   @map("ballot_id") // 🔑 Anonymous Link: Only connects to the BALLOT token, NOT the voter's PII
   positionId String   @map("position_id")
   candidateId String  @map("candidate_id")
   castAt     DateTime @default(now()) @map("cast_at")
 
-  // Relations
+  // Relations:
   ballot    Ballot    @relation(fields: [ballotId], references: [id], onDelete: Cascade)
   position  Position  @relation(fields: [positionId], references: [id], onDelete: Cascade)
   candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
 
-  @@unique([ballotId, positionId]) // One vote per position per ballot
+  // Constraint: A single ballot can only cast one vote per position.
+  @@unique([ballotId, positionId]) 
   @@map("votes")
 }
 
-// Password Reset (for candidates)
+// ----------------------------------------------------
+// 📝 Audit Trail & System Logs
+// ----------------------------------------------------
+
+// Model: PasswordReset (Standalone model for user password recovery)
 model PasswordReset {
   id          String    @id @default(uuid())
   userId      String    @map("user_id")
@@ -168,22 +209,22 @@ model PasswordReset {
   resetAt     DateTime? @map("reset_at")
   consumedAt  DateTime? @map("consumed_at")
 
-  // Relations
+  // Relation:
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("password_resets")
 }
 
-// Audit Log (immutable, append-only)
+// Model: AuditLog (The immutable record of system activity)
 model AuditLog {
   id        String   @id @default(uuid())
-  actorType String   @map("actor_type") // "admin", "officer", "candidate", "voter", "system"
-  actorId   String?  @map("actor_id")
-  action    String
-  entity    String?  // "position", "candidate", "vote", etc.
-  entityId  String?  @map("entity_id")
-  payload   Json?    // Additional data
-  createdAt DateTime @default(now()) @map("created_at")
+  actorType String   @map("actor_type") // Who performed the action: "admin", "system", "voter", etc.
+  actorId   String?  @map("actor_id") // The ID of the user/entity that acted
+  action    String // The specific action taken (e.g., "CANDIDATE_APPROVED", "VOTER_LIST_IMPORTED")
+  entity    String?  // The type of object affected (e.g., "position", "candidate")
+  entityId  String?  @map("entity_id") // The ID of the affected object
+  payload   Json?    // Extra, detailed information about the change (e.g., old and new values)
+  createdAt DateTime @default(now()) @map("created_at") // Immutable timestamp
 
   @@map("audit_logs")
 }
